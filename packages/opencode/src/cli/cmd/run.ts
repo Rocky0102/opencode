@@ -7,6 +7,7 @@ import { Flag } from "../../flag/flag"
 import { bootstrap } from "../bootstrap"
 import { EOL } from "os"
 import { Filesystem } from "../../util/filesystem"
+import { mkdir } from "fs/promises"
 import { createOpencodeClient, type Message, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { Server } from "../../server/server"
 import { Provider } from "../../provider/provider"
@@ -297,6 +298,19 @@ export const RunCommand = cmd({
         describe: "show thinking blocks",
         default: false,
       })
+      .option("message-file", {
+        alias: ["M"],
+        type: "string",
+        describe: "file containing the message content to send",
+      })
+      .option("tag", {
+        type: "string",
+        describe: "tag for the session export",
+      })
+      .option("export-dir", {
+        type: "string",
+        describe: "export directory relative to dir for session export",
+      })
   },
   handler: async (args) => {
     let message = [...args.message, ...(args["--"] || [])]
@@ -335,6 +349,18 @@ export const RunCommand = cmd({
           mime,
         })
       }
+    }
+
+    if (args["message-file"]) {
+      const resolvedPath = path.resolve(process.cwd(), args["message-file"])
+      const file = Bun.file(resolvedPath)
+      const stats = await file.stat().catch(() => {})
+      if (!stats || !(await file.exists())) {
+        UI.error(`Message file not found: ${args["message-file"]}`)
+        process.exit(1)
+      }
+      const fileContent = await file.text()
+      message = fileContent
     }
 
     if (!process.stdin.isTTY) message += "\n" + (await Bun.stdin.text())
@@ -403,7 +429,7 @@ export const RunCommand = cmd({
       }
     }
 
-    async function execute(sdk: OpencodeClient) {
+    async function execute(sdk: OpencodeClient, sessionID: string) {
       function tool(part: ToolPart) {
         try {
           if (part.tool === "bash") return bash(props<typeof BashTool>(part))
@@ -575,17 +601,8 @@ export const RunCommand = cmd({
         return args.agent
       })()
 
-      const sessionID = await session(sdk)
-      if (!sessionID) {
-        UI.error("Session not found")
-        process.exit(1)
-      }
-      await share(sdk, sessionID)
 
-      loop().catch((e) => {
-        console.error(e)
-        process.exit(1)
-      })
+      const loopPromise = loop()
 
       if (args.command) {
         await sdk.session.command({
@@ -606,11 +623,104 @@ export const RunCommand = cmd({
           parts: [...files, { type: "text", text: message }],
         })
       }
+
+      // Wait for the event loop to complete (session becomes idle)
+      await loopPromise
+    }
+
+    async function exportSession(sdk: OpencodeClient, sessionID: string) {
+      if (!args.tag) return
+      const dir = directory ?? process.cwd()
+      const exportDir = args.exportDir
+        ? path.join(dir, args.exportDir)
+        : path.join(dir, ".secinsight", "stage1", "opencode_result")
+      await mkdir(exportDir, { recursive: true })
+      const sessionInfo = await sdk.session.get({ sessionID })
+      const messages = await sdk.session.messages({ sessionID, limit: 1000 })
+      
+      // Debug: log what we got
+      
+      // Format as transcript markdown similar to TUI export
+      const messagesWithParts = (messages.data ?? []).map((msg) => ({
+        info: msg.info,
+        parts: msg.parts,
+      }))
+      
+      // Extract model info from messages
+      const modelInfo = messages.data?.find((msg) => msg.info.role === "assistant" && "modelID" in msg.info)
+      const model = modelInfo && "modelID" in modelInfo.info
+        ? { providerID: (modelInfo.info as any).providerID, modelID: (modelInfo.info as any).modelID }
+        : null
+      
+      let transcript = `# ${sessionInfo.data?.title ?? "Session"}\n\n`
+      transcript += `**Session ID:** ${sessionID}\n`
+      transcript += `**Created:** ${sessionInfo.data?.time.created ? new Date(sessionInfo.data.time.created).toLocaleString() : "N/A"}\n`
+      transcript += `**Updated:** ${sessionInfo.data?.time.updated ? new Date(sessionInfo.data.time.updated).toLocaleString() : "N/A"}\n`
+      if (model) {
+        transcript += `**Model:** ${model.providerID}/${model.modelID}\n`
+      }
+      transcript += `\n---\n\n`
+      
+      for (const msg of messagesWithParts) {
+        // Format message header
+        if (msg.info.role === "user") {
+          transcript += `## User\n\n`
+        } else {
+          transcript += `## Assistant\n\n`
+        }
+        
+        // Format message parts
+        for (const part of msg.parts) {
+          if (part.type === "text" && !part.synthetic) {
+            transcript += `${part.text}\n\n`
+          } else if (part.type === "reasoning") {
+            transcript += `_Thinking:_\n\n${part.text}\n\n`
+          } else if (part.type === "tool") {
+            transcript += `**Tool: ${part.tool}**\n`
+            if (part.state.input) {
+              transcript += `\n**Input:**\n\`\`\`json\n${JSON.stringify(part.state.input, null, 2)}\n\`\`\`\n`
+            }
+            if (part.state.status === "completed" && part.state.output) {
+              transcript += `\n**Output:**\n\`\`\`\n${part.state.output}\n\`\`\`\n`
+            }
+            if (part.state.status === "error" && part.state.error) {
+              transcript += `\n**Error:**\n\`\`\`\n${part.state.error}\n\`\`\`\n`
+            }
+            transcript += `\n`
+          }
+        }
+        
+        transcript += `---\n\n`
+      }
+      
+      const mdFilename = `${args.tag}_session.md`
+      const mdFilepath = path.join(exportDir, mdFilename)
+      await Bun.write(mdFilepath, transcript)
+      
+      // Save JSON file
+      const jsonFilename = `${args.tag}_session.json`
+      const jsonFilepath = path.join(exportDir, jsonFilename)
+      const jsonData = {
+        session: sessionInfo.data,
+        model,
+        messages: messages.data,
+      }
+      await Bun.write(jsonFilepath, JSON.stringify(jsonData, null, 2))
     }
 
     if (args.attach) {
       const sdk = createOpencodeClient({ baseUrl: args.attach, directory })
-      return await execute(sdk)
+      const sessionID = await session(sdk)
+      if (!sessionID) {
+        UI.error("Session not found")
+        process.exit(1)
+      }
+      try {
+        await execute(sdk, sessionID)
+      } finally {
+        await exportSession(sdk, sessionID)
+      }
+      return
     }
 
     await bootstrap(process.cwd(), async () => {
@@ -619,7 +729,17 @@ export const RunCommand = cmd({
         return Server.App().fetch(request)
       }) as typeof globalThis.fetch
       const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })
-      await execute(sdk)
+      const sessionID = await session(sdk)
+      if (!sessionID) {
+        UI.error("Session not found")
+        process.exit(1)
+      }
+      await share(sdk, sessionID)
+      try {
+        await execute(sdk, sessionID)
+      } finally {
+        await exportSession(sdk, sessionID)
+      }
     })
   },
 })
