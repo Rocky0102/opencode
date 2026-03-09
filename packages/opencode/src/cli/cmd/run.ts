@@ -642,7 +642,7 @@ export const RunCommand = cmd({
       
       // Format as transcript markdown similar to TUI export
       const messagesWithParts = (messages.data ?? []).map((msg) => ({
-        info: msg.info,
+        info: (() => { const { summary: _, ...rest } = msg.info as any; return rest })(),
         parts: msg.parts,
       }))
       
