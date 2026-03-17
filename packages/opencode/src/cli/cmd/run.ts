@@ -632,7 +632,7 @@ export const RunCommand = cmd({
       if (!args.tag) return
       const dir = directory ?? process.cwd()
       const exportDir = args.exportDir
-        ? path.join(dir, args.exportDir)
+        ? args.exportDir
         : path.join(dir, ".secinsight", "stage1", "opencode_result")
       await mkdir(exportDir, { recursive: true })
       const sessionInfo = await sdk.session.get({ sessionID })
